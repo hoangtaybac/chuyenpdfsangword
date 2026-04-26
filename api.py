@@ -1,4 +1,4 @@
-import os, re, tempfile, base64, shutil, subprocess, uuid, html as html_lib, zipfile
+import os, re, tempfile, base64, shutil, subprocess, uuid
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -148,44 +148,31 @@ def _decode_image_to_file(img_id: str, b64: str, img_dir: Path) -> Optional[Path
 
 
 def _prepare_markdown_for_docx(content: str, images: Dict[str, str], workdir: Path) -> str:
-    """Chuẩn hóa Markdown để Pandoc chuyển công thức LaTeX thành Word Equation thật (OMML)."""
+    """Chuẩn hóa Markdown để Pandoc chuyển $...$/$$...$$ thành Word Equation thật (OMML)."""
     md = content or ""
 
-    # Clean giống phần xem trước: bỏ markdown/thẻ thừa thường gặp.
+    # Bỏ vài ký hiệu Markdown thừa do OCR để Word gọn hơn.
     md = re.sub(r"^\s*```.*?$", "", md, flags=re.MULTILINE)
-    md = re.sub(r"(Câu\s*\d+\s*[\.:]?)\s*\*\*", r"\1 ", md, flags=re.I)
-    md = re.sub(r"^\s*\*\*\s*$", "", md, flags=re.MULTILINE)
-    md = re.sub(r"\*\*\s+(?=(Khảo sát|Cho|Tính|Tìm|Một|Trong|Biết|Hỏi|Lời giải|Đáp án))", "", md, flags=re.I)
     md = re.sub(r"\*\*\s*(Lời\s*giải\s*:?)\s*\*\*", r"\n\n**\1**\n", md, flags=re.I)
 
     img_dir = workdir / "images"
     img_dir.mkdir(exist_ok=True)
-
-    # Chỉ thay placeholder [HÌNH: id] thành ảnh. Không thay mọi chữ img-id để tránh lặp ảnh.
-    inserted_ids = set()
     for img_id, b64 in (images or {}).items():
         img_path = _decode_image_to_file(img_id, b64, img_dir)
         if not img_path:
             continue
         rel = img_path.relative_to(workdir).as_posix()
         md_img = f"\n\n![{img_id}]({rel})\n\n"
-        pat = r"\[\s*H(?:Ì|I)NH\s*:\s*" + re.escape(img_id) + r"\s*\]"
-        md, n = re.subn(pat, md_img, md, flags=re.I)
-        if n:
-            inserted_ids.add(img_id)
+        patterns = [
+            r"\[\s*HÌNH\s*:\s*" + re.escape(img_id) + r"\s*\]",
+            r"\[\s*Hình\s*:\s*" + re.escape(img_id) + r"\s*\]",
+            re.escape(img_id),
+        ]
+        for pat in patterns:
+            md = re.sub(pat, md_img, md, flags=re.I)
 
-    # Xóa các dòng ảnh rác còn sót để không bị lặp như img-7.jpeg.
-    md = re.sub(r"^\s*H(?:Ì|I)NH\s*:.*$", "", md, flags=re.I | re.MULTILINE)
-    md = re.sub(r"^\s*img-\d+\.(?:jpe?g|png|webp|gif)\s*$", "", md, flags=re.I | re.MULTILINE)
-    md = re.sub(r"^\s*\]\s*$", "", md, flags=re.MULTILINE)
-
-    # Bỏ dòng phân cách markdown table lỗi.
+    # Giảm lỗi bảng markdown OCR: bỏ hàng chỉ toàn --- nếu bị đứng riêng.
     md = re.sub(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", "", md, flags=re.MULTILINE)
-
-    # Chuyển bảng text OCR thành HTML table có border trước khi Pandoc xuất DOCX.
-    md = _convert_plain_tables_in_markdown(md)
-
-    md = re.sub(r"\n{3,}", "\n\n", md)
     return md.strip() + "\n"
 
 @app.post("/export-docx")
@@ -219,7 +206,6 @@ async def export_docx(payload: ExportDocxPayload):
         if completed.returncode != 0 or not docx_path.exists():
             raise RuntimeError(completed.stderr or completed.stdout or "Pandoc không tạo được file docx")
 
-        _add_visible_borders_to_docx(docx_path)
         filename = _safe_filename(payload.title or "ket-qua-ocr") + ".docx"
         return FileResponse(
             path=str(docx_path),
@@ -233,185 +219,9 @@ async def export_docx(payload: ExportDocxPayload):
         raise HTTPException(status_code=500, detail=f"Lỗi xuất Word: {e}")
 
 
-
-def _strip_tags_for_detect(s: str) -> str:
-    s = re.sub(r"<[^>]+>", " ", s or "")
-    s = html_lib.unescape(s).replace("\xa0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _variation_label_and_cells(line: str):
-    """Nhận 1 dòng kiểu: x -∞ -1 1 +∞ / f'(x) + 0 - 0 / f(x) -∞ 2 -2 +∞."""
-    text = _strip_tags_for_detect(line)
-    if not text:
-        return None
-    text = (text.replace("−", "-")
-                .replace("\\(", " ").replace("\\)", " ")
-                .replace("$", " ").replace("\\,", " "))
-    text = re.sub(r"\s+", " ", text).strip()
-    m = re.match(r"^(x|f\s*['′]\s*\(\s*x\s*\)|f\s*\(\s*x\s*\)|y\s*['′]?|y)\b\s*(.*)$", text, re.I)
-    if not m:
-        return None
-    label = re.sub(r"\s+", "", m.group(1))
-    label = label.replace("′", "'")
-    rest = m.group(2).strip()
-    if label.lower() == "y":
-        label = "y"
-    parts = [label]
-    if rest:
-        # Tách các mốc/cell; giữ dấu vô cực và dấu + - thành cell riêng khi đứng riêng.
-        rest = rest.replace("+∞", "+∞").replace("-∞", "-∞")
-        parts += [p for p in re.split(r"\s+", rest) if p]
-    return parts
-
-
-
-def _generic_table_cells(line: str):
-    """Nhận các dòng bảng số liệu dạng nhiều cột cách nhau bằng tab / nhiều khoảng trắng.
-    Bản sửa: không collapse toàn bộ khoảng trắng trước khi tách, để không mất cấu trúc cột.
-    """
-    raw = re.sub(r"<[^>]+>", " ", line or "")
-    raw = html_lib.unescape(raw).replace("\xa0", " ").strip()
-    raw = raw.replace("\\(", " ").replace("\\)", " ").replace("$", " ")
-    if not raw.strip():
-        return None
-
-    compact = re.sub(r"\s+", " ", raw).strip()
-    if re.match(r"^(Câu|Bài)\s+\d+", compact, re.I):
-        return None
-    # tránh bắt nhầm câu văn dài
-    if compact.endswith((".", "?", ":")) and not re.search(r"\[[^\]]+\)|\b\d+\b", compact):
-        return None
-
-    if "\t" in raw:
-        cells = [c.strip() for c in raw.split("\t") if c.strip()]
-    else:
-        cells = [c.strip() for c in re.split(r"\s{2,}", raw) if c.strip()]
-
-    if len(cells) >= 3:
-        return cells
-    if len(cells) >= 2 and (re.search(r"\[[^\]]+\)|\b\d+\b", raw)) and not compact.endswith((".", "?", ":")):
-        return cells
-    return None
-
-
-def _any_table_cells(line: str):
-    return _variation_label_and_cells(line) or _generic_table_cells(line)
-
-def _html_table_from_variation_rows(rows):
-    parsed = []
-    max_cols = 0
-    for r in rows:
-        cells = _any_table_cells(r)
-        if not cells:
-            continue
-        parsed.append(cells)
-        max_cols = max(max_cols, len(cells))
-    if len(parsed) < 2:
-        return "<br>".join(rows)
-    for cells in parsed:
-        while len(cells) < max_cols:
-            cells.append("&nbsp;")
-    out = ['<table class="latex-table">']
-    for cells in parsed:
-        out.append('<tr>')
-        for i, c in enumerate(cells):
-            c = c if c == "&nbsp;" else html_lib.escape(str(c))
-            out.append(f'<td class="row-head">{c}</td>' if i == 0 else f'<td>{c}</td>')
-        out.append('</tr>')
-    out.append('</table>')
-    return "".join(out)
-
-
-
-def _convert_plain_tables_in_markdown(md: str) -> str:
-    """Chuyển bảng OCR còn dạng dòng chữ thành raw HTML table.
-    Vẫn giữ nguyên các khối $$...$$ để Pandoc chuyển công thức thành Word Equation.
-    """
-    lines = (md or "").splitlines()
-    out = []
-    buf = []
-    in_display_math = False
-
-    def flush():
-        nonlocal buf
-        if buf:
-            out.append(_html_table_from_variation_rows(buf))
-            buf = []
-
-    for line in lines:
-        stripped = line.strip()
-
-        # Không xử lý bảng bên trong công thức display math.
-        if stripped == "$$" or stripped.startswith("$$") or stripped.endswith("$$"):
-            flush()
-            out.append(line)
-            if stripped == "$$":
-                in_display_math = not in_display_math
-            continue
-
-        if in_display_math:
-            out.append(line)
-            continue
-
-        if _any_table_cells(line):
-            buf.append(line)
-        else:
-            flush()
-            out.append(line)
-    flush()
-    return "\n".join(out)
-
-
-def _convert_plain_variation_tables_in_fragment(fragment: str) -> str:
-    """Chuyển các dòng bảng còn ở dạng chữ thành <table> trước khi xuất Word."""
-    if not fragment:
-        return fragment
-    pieces = re.split(r"(<br\s*/?>|\n)", fragment, flags=re.I)
-    lines, seps = [], []
-    for i, p in enumerate(pieces):
-        if re.fullmatch(r"<br\s*/?>|\n", p or "", flags=re.I):
-            seps.append(p)
-        else:
-            lines.append(p)
-    if len(lines) < 2:
-        return fragment
-    out = []
-    buf = []
-
-    def flush_buf():
-        nonlocal buf
-        if buf:
-            out.append(_html_table_from_variation_rows(buf))
-            buf = []
-
-    for line in lines:
-        if _any_table_cells(line):
-            buf.append(line)
-        else:
-            flush_buf()
-            if line.strip():
-                out.append(line)
-    flush_buf()
-    return "<br>".join(out)
-
-
-def _convert_plain_variation_tables_in_html(html: str) -> str:
-    # Xử lý trong từng thẻ p/div trước, tránh phá cấu trúc ảnh/table đã có.
-    def repl_block(m):
-        tag, attrs, inner = m.group(1), m.group(2) or "", m.group(3)
-        if "<table" in inner.lower() or "<img" in inner.lower():
-            return m.group(0)
-        fixed = _convert_plain_variation_tables_in_fragment(inner)
-        return f"<{tag}{attrs}>{fixed}</{tag}>"
-    html = re.sub(r"<(p|div)([^>]*)>(.*?)</\1>", repl_block, html or "", flags=re.I|re.S)
-    return html
-
 def _prepare_preview_html_for_docx(html: str, workdir: Path) -> str:
     """Nhận đúng HTML phần xem trước, tách data:image ra file thật để Pandoc không lặp/không mất ảnh."""
     html = html or ""
-    html = _convert_plain_variation_tables_in_html(html)
     img_dir = workdir / "preview_images"
     img_dir.mkdir(exist_ok=True)
 
@@ -447,7 +257,7 @@ def _prepare_preview_html_for_docx(html: str, workdir: Path) -> str:
       body{font-family:Arial, sans-serif;font-size:12pt;line-height:1.25;color:#111827;}
       p{margin:2px 0;}
       img{max-width:55%;display:block;margin:8px auto;border:0;}
-      table{border-collapse:collapse;margin:10px 0;width:auto;}
+      table{border-collapse:collapse;margin:10px 0;}
       td,th{border:1px solid #334155;padding:6px 10px;text-align:center;vertical-align:middle;}
       .solution-title{display:block;width:100%;text-align:center;color:#0f3d91;font-size:13pt;font-weight:700;margin:8px 0 6px;}
     </style>
@@ -458,52 +268,6 @@ def _prepare_preview_html_for_docx(html: str, workdir: Path) -> str:
     elif "</head>" in html.lower():
         html = re.sub(r"</head>", style + "</head>", html, count=1, flags=re.I)
     return html
-
-
-def _add_visible_borders_to_docx(docx_path: Path):
-    """Ép tất cả bảng trong DOCX có đường kẻ rõ, vì Pandoc đôi khi tạo bảng nhưng Word không hiện border."""
-    tmp_dir = docx_path.parent / (docx_path.stem + "_unzipped")
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(docx_path, 'r') as z:
-        z.extractall(tmp_dir)
-    document_xml = tmp_dir / 'word' / 'document.xml'
-    if not document_xml.exists():
-        return
-    import xml.etree.ElementTree as ET
-    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-    ET.register_namespace('w', ns['w'])
-    tree = ET.parse(document_xml)
-    root = tree.getroot()
-    W = '{%s}' % ns['w']
-    changed = False
-    for tbl in root.findall('.//w:tbl', ns):
-        tblPr = tbl.find('w:tblPr', ns)
-        if tblPr is None:
-            tblPr = ET.Element(W + 'tblPr')
-            tbl.insert(0, tblPr)
-        old = tblPr.find('w:tblBorders', ns)
-        if old is not None:
-            tblPr.remove(old)
-        borders = ET.Element(W + 'tblBorders')
-        for name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
-            el = ET.SubElement(borders, W + name)
-            el.set(W + 'val', 'single')
-            el.set(W + 'sz', '8')
-            el.set(W + 'space', '0')
-            el.set(W + 'color', '334155')
-        tblPr.append(borders)
-        changed = True
-    if changed:
-        tree.write(document_xml, encoding='utf-8', xml_declaration=True)
-        new_docx = docx_path.parent / (docx_path.stem + '_bordered.docx')
-        with zipfile.ZipFile(new_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for f in tmp_dir.rglob('*'):
-                if f.is_file():
-                    zout.write(f, f.relative_to(tmp_dir).as_posix())
-        shutil.move(str(new_docx), str(docx_path))
-    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 @app.post("/export-docx-preview")
 async def export_docx_preview(payload: ExportPreviewHtmlPayload):
@@ -524,7 +288,6 @@ async def export_docx_preview(payload: ExportPreviewHtmlPayload):
         completed = subprocess.run(cmd, cwd=str(tmp_root), capture_output=True, text=True, timeout=120)
         if completed.returncode != 0 or not docx_path.exists():
             raise RuntimeError(completed.stderr or completed.stdout or "Pandoc không tạo được file docx")
-        _add_visible_borders_to_docx(docx_path)
         filename = _safe_filename(payload.title or "ket-qua-ocr") + ".docx"
         return FileResponse(path=str(docx_path), filename=filename, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", background=None)
     except HTTPException:

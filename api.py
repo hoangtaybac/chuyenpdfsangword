@@ -1,14 +1,19 @@
-import os, re, tempfile, base64, xml.etree.ElementTree as ET, requests
-from typing import Dict, Any
+import os, re, tempfile, base64, shutil, subprocess, uuid
+from pathlib import Path
+from typing import Dict, Any, Optional
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from PyPDF2 import PdfReader
+
 try:
     from mistralai.client import Mistral
 except Exception:
     from mistralai import Mistral
 
-app = FastAPI(title="PDF OCR API", version="1.0.0")
+app = FastAPI(title="PDF OCR API", version="1.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Khuyến nghị: đặt MISTRAL_API_KEY trong biến môi trường trên Railway/Render.
@@ -58,9 +63,14 @@ def clean_text_and_images(text: str, images: Dict[str, str]) -> str:
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
+class ExportDocxPayload(BaseModel):
+    content: str = ""
+    images: Dict[str, str] = {}
+    title: Optional[str] = "ket-qua-ocr"
+
 @app.get("/")
 def root():
-    return {"ok": True, "service": "PDF OCR API", "endpoint": "POST /ocr"}
+    return {"ok": True, "service": "PDF OCR API", "endpoint": "POST /ocr", "export": "POST /export-docx"}
 
 @app.post("/ocr")
 async def ocr_pdf(file: UploadFile = File(...)):
@@ -112,3 +122,94 @@ async def ocr_pdf(file: UploadFile = File(...)):
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r"[^a-zA-Z0-9_\-.]+", "-", name or "ket-qua-ocr").strip("-_.")
+    return name or "ket-qua-ocr"
+
+
+def _decode_image_to_file(img_id: str, b64: str, img_dir: Path) -> Optional[Path]:
+    try:
+        raw = b64.split(",", 1)[1] if b64.startswith("data:") and "," in b64 else b64
+        data = base64.b64decode(raw)
+        ext = Path(img_id).suffix.lower() or ".jpg"
+        if ext not in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+            ext = ".jpg"
+        out = img_dir / (Path(img_id).stem + ext)
+        out.write_bytes(data)
+        return out
+    except Exception:
+        return None
+
+
+def _prepare_markdown_for_docx(content: str, images: Dict[str, str], workdir: Path) -> str:
+    """Chuẩn hóa Markdown để Pandoc chuyển $...$/$$...$$ thành Word Equation thật (OMML)."""
+    md = content or ""
+
+    # Bỏ vài ký hiệu Markdown thừa do OCR để Word gọn hơn.
+    md = re.sub(r"^\s*```.*?$", "", md, flags=re.MULTILINE)
+    md = re.sub(r"\*\*\s*(Lời\s*giải\s*:?)\s*\*\*", r"\n\n**\1**\n", md, flags=re.I)
+
+    img_dir = workdir / "images"
+    img_dir.mkdir(exist_ok=True)
+    for img_id, b64 in (images or {}).items():
+        img_path = _decode_image_to_file(img_id, b64, img_dir)
+        if not img_path:
+            continue
+        rel = img_path.relative_to(workdir).as_posix()
+        md_img = f"\n\n![{img_id}]({rel})\n\n"
+        patterns = [
+            r"\[\s*HÌNH\s*:\s*" + re.escape(img_id) + r"\s*\]",
+            r"\[\s*Hình\s*:\s*" + re.escape(img_id) + r"\s*\]",
+            re.escape(img_id),
+        ]
+        for pat in patterns:
+            md = re.sub(pat, md_img, md, flags=re.I)
+
+    # Giảm lỗi bảng markdown OCR: bỏ hàng chỉ toàn --- nếu bị đứng riêng.
+    md = re.sub(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", "", md, flags=re.MULTILINE)
+    return md.strip() + "\n"
+
+@app.post("/export-docx")
+async def export_docx(payload: ExportDocxPayload):
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="Chưa có nội dung để xuất Word")
+
+    pandoc_bin = os.getenv("PANDOC_PATH") or shutil.which("pandoc")
+    if not pandoc_bin:
+        raise HTTPException(
+            status_code=500,
+            detail="Server chưa có Pandoc nên chưa xuất được Word Equation thật. Cần cài pandoc hoặc đặt biến PANDOC_PATH."
+        )
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="docx_export_"))
+    try:
+        md = _prepare_markdown_for_docx(payload.content, payload.images, tmp_root)
+        md_path = tmp_root / "input.md"
+        docx_path = tmp_root / f"{uuid.uuid4().hex}.docx"
+        md_path.write_text(md, encoding="utf-8")
+
+        cmd = [
+            pandoc_bin,
+            str(md_path),
+            "-f", "markdown+tex_math_dollars+tex_math_single_backslash+pipe_tables",
+            "-t", "docx",
+            "--resource-path", str(tmp_root),
+            "-o", str(docx_path),
+        ]
+        completed = subprocess.run(cmd, cwd=str(tmp_root), capture_output=True, text=True, timeout=120)
+        if completed.returncode != 0 or not docx_path.exists():
+            raise RuntimeError(completed.stderr or completed.stdout or "Pandoc không tạo được file docx")
+
+        filename = _safe_filename(payload.title or "ket-qua-ocr") + ".docx"
+        return FileResponse(
+            path=str(docx_path),
+            filename=filename,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            background=None,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi xuất Word: {e}")

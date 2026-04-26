@@ -458,6 +458,15 @@ def _fix_latex_math_blocks_for_docx(html: str) -> str:
 def _prepare_preview_html_for_docx(html: str, workdir: Path) -> str:
     """Nhận đúng HTML phần xem trước, tách data:image ra file thật để Pandoc không lặp/không mất ảnh."""
     html = html or ""
+
+    # FIX: Không để CSS/JS/head bị Pandoc đọc thành chữ và in lên đầu file Word.
+    # Lỗi trước đây: phần <style>body{...}</style> bị chuyển thành văn bản thường trong DOCX.
+    html = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", html, flags=re.I)
+    html = re.sub(r"<style[^>]*>[\s\S]*?</style>", "", html, flags=re.I)
+    html = re.sub(r"<!doctype[^>]*>", "", html, flags=re.I)
+    html = re.sub(r"<head[^>]*>[\s\S]*?</head>", "", html, flags=re.I)
+    html = re.sub(r"</?(?:html|body)[^>]*>", "", html, flags=re.I)
+
     # Quan trọng: sửa công thức trước khi Pandoc đọc HTML. Nếu trong $$...$$ có <br>, Word sẽ hiện nguyên LaTeX.
     html = _fix_latex_math_blocks_for_docx(html)
     html = _convert_plain_variation_tables_in_html(html)
@@ -566,6 +575,12 @@ def _html_preview_to_markdown_for_pandoc(html: str) -> str:
     Hàm này vẫn giữ bảng bằng pipe table và giữ ảnh bằng Markdown image.
     """
     html = html or ""
+
+    # FIX chắc chắn lần 2: xóa CSS/JS/head trước khi bỏ tag HTML.
+    # Nếu không xóa ở đây, nội dung trong <style> sẽ còn lại thành chữ ở đầu Word.
+    html = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", html, flags=re.I)
+    html = re.sub(r"<style[^>]*>[\s\S]*?</style>", "", html, flags=re.I)
+    html = re.sub(r"<head[^>]*>[\s\S]*?</head>", "", html, flags=re.I)
 
     # Chuyển các bảng HTML thành bảng Markdown pipe table để Word có hàng/cột thật.
     def repl_table(m):

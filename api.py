@@ -41,6 +41,57 @@ def extract_with_regex(text: str, result_data: Dict[str, Any]):
     for img_id, img_base64 in image_matches:
         result_data["images"][img_id] = img_base64
 
+
+def _is_dot_leader_line(line: str) -> bool:
+    """Nhận diện dòng chấm/ô trống điền đáp án trong PDF, không được xóa khi OCR."""
+    t = (line or "").strip()
+    if not t:
+        return False
+    return bool(re.fullmatch(r"[\.\u2026\u2025\u22EF_\-\s]{8,}", t))
+
+
+def _normalize_answer_dot_lines(text: str) -> str:
+    """Giữ và chuẩn hóa các dòng chấm trong phần A. CÂU HỎI NGẮN.
+    Một số OCR bỏ mất chuỗi dấu chấm vì coi là trang trí; hàm này tự chèn lại sau câu hỏi ngắn.
+    Không chèn vào phần trắc nghiệm A/B/C/D hoặc Đúng/Sai.
+    """
+    lines = (text or "").splitlines()
+    out = []
+    in_short_answer = False
+
+    def next_non_empty(idx: int) -> str:
+        for j in range(idx + 1, min(len(lines), idx + 4)):
+            if lines[j].strip():
+                return lines[j].strip()
+        return ""
+
+    for i, line in enumerate(lines):
+        raw = line.rstrip()
+        stripped = raw.strip()
+        upper = stripped.upper()
+
+        if re.search(r"\bA\.\s*CÂU\s*HỎI\s*NGẮN\b", upper):
+            in_short_answer = True
+        elif re.search(r"\b(B|C|D)\.\s*CÂU|\bĐỀ\s*LUYỆN|PHẦN\s*I|TRẮC\s*NGHIỆM|ĐÚNG\s*/\s*SAI", upper):
+            in_short_answer = False
+
+        if _is_dot_leader_line(stripped):
+            out.append("................................................................................................")
+            continue
+
+        out.append(raw)
+
+        # Nếu là câu hỏi ngắn kết thúc bằng ? mà OCR đã làm mất dòng chấm ngay sau thì chèn lại.
+        if in_short_answer and re.match(r"^Câu\s*\d+\s*[\.:]", stripped, re.I) and stripped.endswith("?"):
+            nxt = next_non_empty(i)
+            if not _is_dot_leader_line(nxt) and (not nxt or re.match(r"^Câu\s*\d+\s*[\.:]", nxt, re.I) or re.search(r"^\b(B|C|D)\.", nxt.upper())):
+                out.append("................................................................................................")
+
+    fixed = "\n".join(out)
+    fixed = re.sub(r"(\n\.{32,}){2,}", "\n................................................................................................", fixed)
+    return fixed
+
+
 def clean_text_and_images(text: str, images: Dict[str, str]) -> str:
     cleaned = text
     cleaned = re.sub(r'OCRPageObject\(.*?\)', '', cleaned)
@@ -60,6 +111,8 @@ def clean_text_and_images(text: str, images: Dict[str, str]) -> str:
     cleaned = re.sub(r'^\s*HÌNH:\s*.*$', '', cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r'^\s*img-\d+\.jpeg\s*$', '', cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r'^\s*\]\s*$', '', cleaned, flags=re.MULTILINE)
+    # GIỮ DÒNG CHẤM/Ô TRỐNG ĐIỀN ĐÁP ÁN: không xóa \u2026 hoặc chuỗi dấu chấm dài.
+    cleaned = _normalize_answer_dot_lines(cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 

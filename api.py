@@ -68,9 +68,13 @@ class ExportDocxPayload(BaseModel):
     images: Dict[str, str] = {}
     title: Optional[str] = "ket-qua-ocr"
 
+class ExportPreviewHtmlPayload(BaseModel):
+    html: str = ""
+    title: Optional[str] = "ket-qua-ocr"
+
 @app.get("/")
 def root():
-    return {"ok": True, "service": "PDF OCR API", "endpoint": "POST /ocr", "export": "POST /export-docx"}
+    return {"ok": True, "service": "PDF OCR API", "endpoint": "POST /ocr", "export": "POST /export-docx", "export_preview": "POST /export-docx-preview"}
 
 @app.post("/ocr")
 async def ocr_pdf(file: UploadFile = File(...)):
@@ -213,3 +217,81 @@ async def export_docx(payload: ExportDocxPayload):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi xuất Word: {e}")
+
+
+def _prepare_preview_html_for_docx(html: str, workdir: Path) -> str:
+    """Nhận đúng HTML phần xem trước, tách data:image ra file thật để Pandoc không lặp/không mất ảnh."""
+    html = html or ""
+    img_dir = workdir / "preview_images"
+    img_dir.mkdir(exist_ok=True)
+
+    html = re.sub(r"\[\s*HÌNH\s*:?\s*\]", "", html, flags=re.I)
+    html = re.sub(r"^\s*\]\s*$", "", html, flags=re.M)
+
+    def repl_img(match):
+        before, src, after = match.group(1), match.group(2), match.group(3)
+        if not src.startswith("data:image"):
+            return match.group(0)
+        try:
+            header, raw = src.split(",", 1)
+            ext = ".png"
+            if "jpeg" in header or "jpg" in header:
+                ext = ".jpg"
+            elif "gif" in header:
+                ext = ".gif"
+            elif "webp" in header:
+                ext = ".webp"
+            data = base64.b64decode(raw)
+            out = img_dir / f"img_{uuid.uuid4().hex}{ext}"
+            out.write_bytes(data)
+            rel = out.relative_to(workdir).as_posix()
+            return f'<img{before} src="{rel}"{after}>'
+        except Exception:
+            return ""
+
+    html = re.sub(r"<img([^>]*?)\s+src=[\"']([^\"']+)[\"']([^>]*)>", repl_img, html, flags=re.I)
+    html = re.sub(r"(?im)^\s*img-\d+\.(?:jpe?g|png|webp)\s*$", "", html)
+
+    style = """
+    <style>
+      body{font-family:Arial, sans-serif;font-size:12pt;line-height:1.25;color:#111827;}
+      p{margin:2px 0;}
+      img{max-width:55%;display:block;margin:8px auto;border:0;}
+      table{border-collapse:collapse;margin:10px 0;}
+      td,th{border:1px solid #334155;padding:6px 10px;text-align:center;vertical-align:middle;}
+      .solution-title{display:block;width:100%;text-align:center;color:#0f3d91;font-size:13pt;font-weight:700;margin:8px 0 6px;}
+    </style>
+    """
+
+    if "<html" not in html.lower():
+        html = f'<!doctype html><html><head><meta charset="utf-8">{style}</head><body>{html}</body></html>'
+    elif "</head>" in html.lower():
+        html = re.sub(r"</head>", style + "</head>", html, count=1, flags=re.I)
+    return html
+
+@app.post("/export-docx-preview")
+async def export_docx_preview(payload: ExportPreviewHtmlPayload):
+    if not payload.html.strip():
+        raise HTTPException(status_code=400, detail="Chưa có nội dung xem trước để xuất Word")
+
+    pandoc_bin = os.getenv("PANDOC_PATH") or shutil.which("pandoc")
+    if not pandoc_bin:
+        raise HTTPException(status_code=500, detail="Server chưa có Pandoc nên chưa xuất được Word. Cần cài pandoc hoặc đặt biến PANDOC_PATH.")
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="docx_preview_export_"))
+    try:
+        html = _prepare_preview_html_for_docx(payload.html, tmp_root)
+        html_path = tmp_root / "preview.html"
+        docx_path = tmp_root / f"{uuid.uuid4().hex}.docx"
+        html_path.write_text(html, encoding="utf-8")
+        cmd = [pandoc_bin, str(html_path), "-f", "html+tex_math_dollars+tex_math_single_backslash", "-t", "docx", "--resource-path", str(tmp_root), "-o", str(docx_path)]
+        completed = subprocess.run(cmd, cwd=str(tmp_root), capture_output=True, text=True, timeout=120)
+        if completed.returncode != 0 or not docx_path.exists():
+            raise RuntimeError(completed.stderr or completed.stdout or "Pandoc không tạo được file docx")
+        filename = _safe_filename(payload.title or "ket-qua-ocr") + ".docx"
+        return FileResponse(path=str(docx_path), filename=filename, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", background=None)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi xuất Word từ phần xem trước: {e}")
+

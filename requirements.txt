@@ -1,8 +1,0 @@
-streamlit
-mistralai
-PyPDF2
-requests
-pycryptodome
-extra-streamlit-components
-pillow
-python-docx

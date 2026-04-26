@@ -221,6 +221,26 @@ async def export_docx(payload: ExportDocxPayload):
 
 
 
+def _remove_css_style_blocks_for_word(html: str) -> str:
+    """Xóa CSS/style/script trước khi xuất Word để CSS không bị hiện thành chữ ở đầu file."""
+    html = html or ""
+    # Xóa nguyên khối <style>...</style> và <script>...</script>.
+    html = re.sub(r"<style\b[^>]*>[\s\S]*?</style>", "", html, flags=re.I)
+    html = re.sub(r"<script\b[^>]*>[\s\S]*?</script>", "", html, flags=re.I)
+
+    # Phòng trường hợp CSS đã bị biến thành text thuần ở đầu payload.
+    head, tail = html[:6000], html[6000:]
+    css_markers = ("font-family", "border-collapse", "solution-title", "latex-table", "row-head")
+    if any(m in head for m in css_markers) and re.search(r"\bbody\s*\{", head):
+        head = re.sub(
+            r"(?is)^\s*(?:css\s*)?(?:id=[\"'][^\"']+[\"']\s*)?body\s*\{[\s\S]*?(?:\.solution-title\s*\{[\s\S]*?\}|(?:\}\s*){2,})\s*",
+            "",
+            head,
+            count=1,
+        )
+    return head + tail
+
+
 def _strip_tags_for_detect(s: str) -> str:
     s = re.sub(r"<[^>]+>", " ", s or "")
     s = html_lib.unescape(s).replace("\xa0", " ")
@@ -420,7 +440,7 @@ def _fix_latex_math_blocks_for_docx(html: str) -> str:
 
 def _prepare_preview_html_for_docx(html: str, workdir: Path) -> str:
     """Nhận đúng HTML phần xem trước, tách data:image ra file thật để Pandoc không lặp/không mất ảnh."""
-    html = html or ""
+    html = _remove_css_style_blocks_for_word(html or "")
     # Quan trọng: sửa công thức trước khi Pandoc đọc HTML. Nếu trong $$...$$ có <br>, Word sẽ hiện nguyên LaTeX.
     html = _fix_latex_math_blocks_for_docx(html)
     html = _convert_plain_variation_tables_in_html(html)
@@ -528,7 +548,7 @@ def _html_preview_to_markdown_for_pandoc(html: str) -> str:
     Lý do: Pandoc đọc HTML thường giữ $$ dưới dạng chữ; đọc Markdown thì chuyển đúng sang OMML.
     Hàm này vẫn giữ bảng bằng pipe table và giữ ảnh bằng Markdown image.
     """
-    html = html or ""
+    html = _remove_css_style_blocks_for_word(html or "")
 
     # Chuyển các bảng HTML thành bảng Markdown pipe table để Word có hàng/cột thật.
     def repl_table(m):

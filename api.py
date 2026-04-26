@@ -521,6 +521,129 @@ def _add_visible_borders_to_docx(docx_path: Path):
         shutil.move(str(new_docx), str(docx_path))
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
+
+
+def _html_preview_to_markdown_for_pandoc(html: str) -> str:
+    """Đổi HTML phần xem trước về Markdown để Pandoc nhận $$...$$ thành Word Equation thật.
+    Lý do: Pandoc đọc HTML thường giữ $$ dưới dạng chữ; đọc Markdown thì chuyển đúng sang OMML.
+    Hàm này vẫn giữ bảng bằng pipe table và giữ ảnh bằng Markdown image.
+    """
+    html = html or ""
+
+    # Chuyển các bảng HTML thành bảng Markdown pipe table để Word có hàng/cột thật.
+    def repl_table(m):
+        table_html = m.group(0)
+        rows = []
+        for tr in re.findall(r"<tr\b[^>]*>(.*?)</tr>", table_html, flags=re.I | re.S):
+            cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", tr, flags=re.I | re.S)
+            row = []
+            for c in cells:
+                c = re.sub(r"<br\s*/?>", " ", c, flags=re.I)
+                c = re.sub(r"<[^>]+>", " ", c)
+                c = html_lib.unescape(c).replace("\xa0", " ")
+                c = re.sub(r"\s+", " ", c).strip()
+                c = c.replace("|", r"\|")
+                row.append(c or " ")
+            if row:
+                rows.append(row)
+
+        if not rows:
+            return ""
+
+        max_cols = max(len(r) for r in rows)
+        for r in rows:
+            while len(r) < max_cols:
+                r.append(" ")
+
+        header = rows[0]
+        out = []
+        out.append("| " + " | ".join(header) + " |")
+        out.append("| " + " | ".join(["---"] * max_cols) + " |")
+        for r in rows[1:]:
+            out.append("| " + " | ".join(r) + " |")
+        return "\n\n" + "\n".join(out) + "\n\n"
+
+    html = re.sub(r"<table\b[\s\S]*?</table>", repl_table, html, flags=re.I)
+
+    # Ảnh: giữ đường dẫn ảnh tương đối đã được tách ra ở _prepare_preview_html_for_docx.
+    def repl_img(m):
+        tag = m.group(0)
+        src_m = re.search(r"\bsrc=[\"']([^\"']+)[\"']", tag, flags=re.I)
+        if not src_m:
+            return ""
+        src = src_m.group(1)
+        return "\n\n![](" + src + ")\n\n"
+
+    html = re.sub(r"<img\b[^>]*>", repl_img, html, flags=re.I)
+
+    # Đổi cấu trúc HTML thành xuống dòng Markdown.
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    html = re.sub(r"</(p|div|h1|h2|h3|h4|h5|h6|li)>", "\n\n", html, flags=re.I)
+    html = re.sub(r"<(p|div|h1|h2|h3|h4|h5|h6|li)\b[^>]*>", "\n", html, flags=re.I)
+
+    # Bỏ tag còn lại, giữ text.
+    md = re.sub(r"<[^>]+>", "", html)
+    md = html_lib.unescape(md).replace("\xa0", " ")
+
+    # Sửa lỗi phổ biến: $$ bị tách dòng/paragraph riêng. Gom lại thành block math chuẩn.
+    md = re.sub(r"(?m)^\s*\$\$\s*$", "$$", md)
+    md = re.sub(r"\$\$\s*\n\s*\$\$", "", md)  # bỏ block rỗng $$ $$
+    md = re.sub(r"\$\$\s*([^\n$][\s\S]*?)\s*\$\$", lambda m: "\n\n$$\n" + _clean_latex_piece_for_docx(m.group(1)) + "\n$$\n\n", md)
+
+    # Chuyển \[...\] thành $$...$$ để Pandoc Markdown nhận chắc chắn.
+    md = re.sub(
+        r"\\\[([\s\S]*?)\\\]",
+        lambda m: "\n\n$$\n" + _clean_latex_piece_for_docx(m.group(1)) + "\n$$\n\n",
+        md,
+    )
+
+    # Chuyển các công thức dạng \( ... \) về inline math sạch.
+    md = re.sub(
+        r"\\\(([\s\S]*?)\\\)",
+        lambda m: r"\(" + _clean_latex_piece_for_docx(m.group(1)).replace("\n", " ") + r"\)",
+        md,
+    )
+
+    # Nếu OCR tạo block kiểu:
+    # $$
+    # công thức
+    # $$
+    # thì giữ; nếu có dòng $$ lẻ không đóng, xóa để không hiện ra Word.
+    lines = md.splitlines()
+    fixed = []
+    in_math = False
+    math_buf = []
+    for line in lines:
+        if line.strip() == "$$":
+            if not in_math:
+                in_math = True
+                math_buf = []
+            else:
+                latex = _clean_latex_piece_for_docx("\n".join(math_buf))
+                if latex:
+                    fixed.append("")
+                    fixed.append("$$")
+                    fixed.append(latex)
+                    fixed.append("$$")
+                    fixed.append("")
+                in_math = False
+                math_buf = []
+            continue
+        if in_math:
+            math_buf.append(line)
+        else:
+            fixed.append(line)
+    # Nếu còn $$ mở mà không đóng thì đưa nội dung ra text thường, bỏ dấu $$ để Word không hiện $$.
+    if in_math and math_buf:
+        fixed.extend(math_buf)
+
+    md = "\n".join(fixed)
+
+    # Dọn khoảng trắng quá nhiều nhưng không phá bảng/công thức.
+    md = re.sub(r"[ \t]+\n", "\n", md)
+    md = re.sub(r"\n{4,}", "\n\n", md).strip() + "\n"
+    return md
+
 @app.post("/export-docx-preview")
 async def export_docx_preview(payload: ExportPreviewHtmlPayload):
     if not payload.html.strip():
@@ -533,10 +656,22 @@ async def export_docx_preview(payload: ExportPreviewHtmlPayload):
     tmp_root = Path(tempfile.mkdtemp(prefix="docx_preview_export_"))
     try:
         html = _prepare_preview_html_for_docx(payload.html, tmp_root)
-        html_path = tmp_root / "preview.html"
+
+        # QUAN TRỌNG:
+        # Không cho Pandoc đọc trực tiếp HTML khi có $$...$$, vì dễ bị xuất nguyên LaTeX ra Word.
+        # Đổi sang Markdown rồi dùng tex_math_dollars để Pandoc tạo Word Equation thật.
+        md = _html_preview_to_markdown_for_pandoc(html)
+        md_path = tmp_root / "preview.md"
         docx_path = tmp_root / f"{uuid.uuid4().hex}.docx"
-        html_path.write_text(html, encoding="utf-8")
-        cmd = [pandoc_bin, str(html_path), "-f", "html+tex_math_dollars+tex_math_single_backslash", "-t", "docx", "--resource-path", str(tmp_root), "-o", str(docx_path)]
+        md_path.write_text(md, encoding="utf-8")
+        cmd = [
+            pandoc_bin,
+            str(md_path),
+            "-f", "markdown+tex_math_dollars+tex_math_single_backslash+pipe_tables",
+            "-t", "docx",
+            "--resource-path", str(tmp_root),
+            "-o", str(docx_path),
+        ]
         completed = subprocess.run(cmd, cwd=str(tmp_root), capture_output=True, text=True, timeout=120)
         if completed.returncode != 0 or not docx_path.exists():
             raise RuntimeError(completed.stderr or completed.stdout or "Pandoc không tạo được file docx")

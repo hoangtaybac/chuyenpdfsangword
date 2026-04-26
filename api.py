@@ -13,7 +13,7 @@ try:
 except Exception:
     from mistralai import Mistral
 
-app = FastAPI(title="PDF OCR API", version="1.1.0")
+app = FastAPI(title="PDF + IMAGE OCR API", version="1.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Khuyến nghị: đặt MISTRAL_API_KEY trong biến môi trường trên Railway/Render.
@@ -74,39 +74,71 @@ class ExportPreviewHtmlPayload(BaseModel):
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "PDF OCR API", "endpoint": "POST /ocr", "export": "POST /export-docx", "export_preview": "POST /export-docx-preview"}
+    return {"ok": True, "service": "PDF + IMAGE OCR API", "endpoint": "POST /ocr", "support": "PDF, JPG, PNG, WEBP", "export": "POST /export-docx", "export_preview": "POST /export-docx-preview"}
 
 @app.post("/ocr")
-async def ocr_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Chỉ nhận file PDF")
+async def ocr_pdf_or_image(file: UploadFile = File(...)):
+    """Nhận cả PDF và ảnh (JPG/PNG/WEBP/BMP/TIFF), OCR bằng Mistral rồi trả về text + images."""
+    filename = file.filename or "upload"
+    lower_name = filename.lower()
+    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
+    is_pdf = lower_name.endswith(".pdf") or file.content_type == "application/pdf"
+    is_image = lower_name.endswith(image_exts) or (file.content_type or "").startswith("image/")
+
+    if not (is_pdf or is_image):
+        raise HTTPException(status_code=400, detail="Chỉ nhận file PDF hoặc ảnh JPG/PNG/JPEG/WEBP")
+
     content = await file.read()
     if len(content) > int(os.getenv("MAX_UPLOAD_BYTES", "52428800")):
         raise HTTPException(status_code=413, detail="File quá lớn")
 
+    suffix = ".pdf" if is_pdf else (Path(lower_name).suffix or ".jpg")
     tmp_path = None
+    uploaded_file_handle = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
-        page_count = len(PdfReader(tmp_path).pages)
-        max_pages = int(os.getenv("MAX_PAGES", "100"))
-        if page_count > max_pages:
-            raise HTTPException(status_code=400, detail=f"PDF có {page_count} trang, vượt giới hạn {max_pages} trang")
+
+        page_count = 1
+        if is_pdf:
+            page_count = len(PdfReader(tmp_path).pages)
+            max_pages = int(os.getenv("MAX_PAGES", "100"))
+            if page_count > max_pages:
+                raise HTTPException(status_code=400, detail=f"PDF có {page_count} trang, vượt giới hạn {max_pages} trang")
 
         client = Mistral(api_key=get_api_key())
         if not hasattr(client, "ocr"):
             raise RuntimeError("SDK mistralai quá cũ, cần bản có client.ocr")
 
-        uploaded_pdf = client.files.upload(file={"file_name": file.filename, "content": open(tmp_path, "rb")}, purpose="ocr")
-        signed_url = client.files.get_signed_url(file_id=uploaded_pdf.id)
-        ocr_response = client.ocr.process(
-            model=os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest"),
-            document={"type": "document_url", "document_url": signed_url.url},
-            include_image_base64=True,
+        uploaded_file_handle = open(tmp_path, "rb")
+        uploaded = client.files.upload(
+            file={"file_name": filename, "content": uploaded_file_handle},
+            purpose="ocr"
         )
+        signed_url = client.files.get_signed_url(file_id=uploaded.id)
 
-        result = {"text": "", "images": {}, "raw_response_size": len(str(ocr_response)), "pages": page_count}
+        document_payload = {"type": "document_url", "document_url": signed_url.url}
+        if is_image:
+            # Mistral OCR hỗ trợ ảnh qua image_url. Nếu SDK/server không hỗ trợ, fallback document_url bên dưới.
+            document_payload = {"type": "image_url", "image_url": signed_url.url}
+
+        try:
+            ocr_response = client.ocr.process(
+                model=os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest"),
+                document=document_payload,
+                include_image_base64=True,
+            )
+        except Exception:
+            if not is_image:
+                raise
+            ocr_response = client.ocr.process(
+                model=os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest"),
+                document={"type": "document_url", "document_url": signed_url.url},
+                include_image_base64=True,
+            )
+
+        result = {"text": "", "images": {}, "raw_response_size": len(str(ocr_response)), "pages": page_count, "file_type": "image" if is_image else "pdf"}
         if hasattr(ocr_response, "model_dump"):
             extract_from_dict(ocr_response.model_dump(), result)
         if not result["text"] and hasattr(ocr_response, "pages"):
@@ -124,6 +156,11 @@ async def ocr_pdf(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        try:
+            if uploaded_file_handle:
+                uploaded_file_handle.close()
+        except Exception:
+            pass
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
@@ -219,26 +256,6 @@ async def export_docx(payload: ExportDocxPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi xuất Word: {e}")
 
-
-
-def _remove_css_style_blocks_for_word(html: str) -> str:
-    """Xóa CSS/style/script trước khi xuất Word để CSS không bị hiện thành chữ ở đầu file."""
-    html = html or ""
-    # Xóa nguyên khối <style>...</style> và <script>...</script>.
-    html = re.sub(r"<style\b[^>]*>[\s\S]*?</style>", "", html, flags=re.I)
-    html = re.sub(r"<script\b[^>]*>[\s\S]*?</script>", "", html, flags=re.I)
-
-    # Phòng trường hợp CSS đã bị biến thành text thuần ở đầu payload.
-    head, tail = html[:6000], html[6000:]
-    css_markers = ("font-family", "border-collapse", "solution-title", "latex-table", "row-head")
-    if any(m in head for m in css_markers) and re.search(r"\bbody\s*\{", head):
-        head = re.sub(
-            r"(?is)^\s*(?:css\s*)?(?:id=[\"'][^\"']+[\"']\s*)?body\s*\{[\s\S]*?(?:\.solution-title\s*\{[\s\S]*?\}|(?:\}\s*){2,})\s*",
-            "",
-            head,
-            count=1,
-        )
-    return head + tail
 
 
 def _strip_tags_for_detect(s: str) -> str:
@@ -440,7 +457,7 @@ def _fix_latex_math_blocks_for_docx(html: str) -> str:
 
 def _prepare_preview_html_for_docx(html: str, workdir: Path) -> str:
     """Nhận đúng HTML phần xem trước, tách data:image ra file thật để Pandoc không lặp/không mất ảnh."""
-    html = _remove_css_style_blocks_for_word(html or "")
+    html = html or ""
     # Quan trọng: sửa công thức trước khi Pandoc đọc HTML. Nếu trong $$...$$ có <br>, Word sẽ hiện nguyên LaTeX.
     html = _fix_latex_math_blocks_for_docx(html)
     html = _convert_plain_variation_tables_in_html(html)
@@ -548,7 +565,7 @@ def _html_preview_to_markdown_for_pandoc(html: str) -> str:
     Lý do: Pandoc đọc HTML thường giữ $$ dưới dạng chữ; đọc Markdown thì chuyển đúng sang OMML.
     Hàm này vẫn giữ bảng bằng pipe table và giữ ảnh bằng Markdown image.
     """
-    html = _remove_css_style_blocks_for_word(html or "")
+    html = html or ""
 
     # Chuyển các bảng HTML thành bảng Markdown pipe table để Word có hàng/cột thật.
     def repl_table(m):

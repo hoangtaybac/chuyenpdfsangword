@@ -148,31 +148,44 @@ def _decode_image_to_file(img_id: str, b64: str, img_dir: Path) -> Optional[Path
 
 
 def _prepare_markdown_for_docx(content: str, images: Dict[str, str], workdir: Path) -> str:
-    """Chuẩn hóa Markdown để Pandoc chuyển $...$/$$...$$ thành Word Equation thật (OMML)."""
+    """Chuẩn hóa Markdown để Pandoc chuyển công thức LaTeX thành Word Equation thật (OMML)."""
     md = content or ""
 
-    # Bỏ vài ký hiệu Markdown thừa do OCR để Word gọn hơn.
+    # Clean giống phần xem trước: bỏ markdown/thẻ thừa thường gặp.
     md = re.sub(r"^\s*```.*?$", "", md, flags=re.MULTILINE)
+    md = re.sub(r"(Câu\s*\d+\s*[\.:]?)\s*\*\*", r"\1 ", md, flags=re.I)
+    md = re.sub(r"^\s*\*\*\s*$", "", md, flags=re.MULTILINE)
+    md = re.sub(r"\*\*\s+(?=(Khảo sát|Cho|Tính|Tìm|Một|Trong|Biết|Hỏi|Lời giải|Đáp án))", "", md, flags=re.I)
     md = re.sub(r"\*\*\s*(Lời\s*giải\s*:?)\s*\*\*", r"\n\n**\1**\n", md, flags=re.I)
 
     img_dir = workdir / "images"
     img_dir.mkdir(exist_ok=True)
+
+    # Chỉ thay placeholder [HÌNH: id] thành ảnh. Không thay mọi chữ img-id để tránh lặp ảnh.
+    inserted_ids = set()
     for img_id, b64 in (images or {}).items():
         img_path = _decode_image_to_file(img_id, b64, img_dir)
         if not img_path:
             continue
         rel = img_path.relative_to(workdir).as_posix()
         md_img = f"\n\n![{img_id}]({rel})\n\n"
-        patterns = [
-            r"\[\s*HÌNH\s*:\s*" + re.escape(img_id) + r"\s*\]",
-            r"\[\s*Hình\s*:\s*" + re.escape(img_id) + r"\s*\]",
-            re.escape(img_id),
-        ]
-        for pat in patterns:
-            md = re.sub(pat, md_img, md, flags=re.I)
+        pat = r"\[\s*H(?:Ì|I)NH\s*:\s*" + re.escape(img_id) + r"\s*\]"
+        md, n = re.subn(pat, md_img, md, flags=re.I)
+        if n:
+            inserted_ids.add(img_id)
 
-    # Giảm lỗi bảng markdown OCR: bỏ hàng chỉ toàn --- nếu bị đứng riêng.
+    # Xóa các dòng ảnh rác còn sót để không bị lặp như img-7.jpeg.
+    md = re.sub(r"^\s*H(?:Ì|I)NH\s*:.*$", "", md, flags=re.I | re.MULTILINE)
+    md = re.sub(r"^\s*img-\d+\.(?:jpe?g|png|webp|gif)\s*$", "", md, flags=re.I | re.MULTILINE)
+    md = re.sub(r"^\s*\]\s*$", "", md, flags=re.MULTILINE)
+
+    # Bỏ dòng phân cách markdown table lỗi.
     md = re.sub(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", "", md, flags=re.MULTILINE)
+
+    # Chuyển bảng text OCR thành HTML table có border trước khi Pandoc xuất DOCX.
+    md = _convert_plain_tables_in_markdown(md)
+
+    md = re.sub(r"\n{3,}", "\n\n", md)
     return md.strip() + "\n"
 
 @app.post("/export-docx")
@@ -255,21 +268,30 @@ def _variation_label_and_cells(line: str):
 
 
 def _generic_table_cells(line: str):
-    """Nhận các dòng bảng số liệu dạng nhiều cột cách nhau bằng tab / nhiều khoảng trắng."""
-    text = _strip_tags_for_detect(line)
-    if not text:
+    """Nhận các dòng bảng số liệu dạng nhiều cột cách nhau bằng tab / nhiều khoảng trắng.
+    Bản sửa: không collapse toàn bộ khoảng trắng trước khi tách, để không mất cấu trúc cột.
+    """
+    raw = re.sub(r"<[^>]+>", " ", line or "")
+    raw = html_lib.unescape(raw).replace("\xa0", " ").strip()
+    raw = raw.replace("\\(", " ").replace("\\)", " ").replace("$", " ")
+    if not raw.strip():
         return None
-    if re.match(r"^(Câu|Bài)\s+\d+", text, re.I):
+
+    compact = re.sub(r"\s+", " ", raw).strip()
+    if re.match(r"^(Câu|Bài)\s+\d+", compact, re.I):
         return None
-    if "\t" in text:
-        cells = [c.strip() for c in text.split("\t") if c.strip()]
+    # tránh bắt nhầm câu văn dài
+    if compact.endswith((".", "?", ":")) and not re.search(r"\[[^\]]+\)|\b\d+\b", compact):
+        return None
+
+    if "\t" in raw:
+        cells = [c.strip() for c in raw.split("\t") if c.strip()]
     else:
-        cells = [c.strip() for c in re.split(r"\s{2,}", text) if c.strip()]
-    if len(cells) < 2:
-        return None
+        cells = [c.strip() for c in re.split(r"\s{2,}", raw) if c.strip()]
+
     if len(cells) >= 3:
         return cells
-    if re.search(r"\[[^\]]+\)|\d", text) and not text.endswith((".", "?", ":")):
+    if len(cells) >= 2 and (re.search(r"\[[^\]]+\)|\b\d+\b", raw)) and not compact.endswith((".", "?", ":")):
         return cells
     return None
 
@@ -300,6 +322,46 @@ def _html_table_from_variation_rows(rows):
         out.append('</tr>')
     out.append('</table>')
     return "".join(out)
+
+
+
+def _convert_plain_tables_in_markdown(md: str) -> str:
+    """Chuyển bảng OCR còn dạng dòng chữ thành raw HTML table.
+    Vẫn giữ nguyên các khối $$...$$ để Pandoc chuyển công thức thành Word Equation.
+    """
+    lines = (md or "").splitlines()
+    out = []
+    buf = []
+    in_display_math = False
+
+    def flush():
+        nonlocal buf
+        if buf:
+            out.append(_html_table_from_variation_rows(buf))
+            buf = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Không xử lý bảng bên trong công thức display math.
+        if stripped == "$$" or stripped.startswith("$$") or stripped.endswith("$$"):
+            flush()
+            out.append(line)
+            if stripped == "$$":
+                in_display_math = not in_display_math
+            continue
+
+        if in_display_math:
+            out.append(line)
+            continue
+
+        if _any_table_cells(line):
+            buf.append(line)
+        else:
+            flush()
+            out.append(line)
+    flush()
+    return "\n".join(out)
 
 
 def _convert_plain_variation_tables_in_fragment(fragment: str) -> str:

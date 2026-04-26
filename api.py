@@ -41,62 +41,6 @@ def extract_with_regex(text: str, result_data: Dict[str, Any]):
     for img_id, img_base64 in image_matches:
         result_data["images"][img_id] = img_base64
 
-
-
-def _normalize_pdf_text_keep_fill_dots(text: str) -> str:
-    """Chuẩn hóa text lấy trực tiếp từ PDF nhưng GIỮ NGUYÊN các dòng chấm điền đáp án.
-    Nhiều OCR coi các dòng ……………… là trang trí và bỏ mất; hàm này dùng text gốc của PDF
-    để bảo toàn số dòng chấm, đặc biệt ở phần CÂU HỎI NGẮN.
-    """
-    if not text:
-        return ""
-    t = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Chuẩn hóa các kiểu dấu chấm kéo dài về dấu chấm thường để HTML/Word dễ hiển thị.
-    t = t.replace("…", ".").replace("․", ".").replace("·", ".")
-    # Một số bộ trích xuất dính nhiều khoảng trắng quanh dòng chấm.
-    lines = []
-    for line in t.split("\n"):
-        raw = line.strip()
-        if not raw:
-            lines.append("")
-            continue
-        # Dòng chỉ gồm dấu chấm/khoảng trắng: giữ độ dài tối thiểu đủ nhìn như PDF.
-        compact = re.sub(r"\s+", "", raw)
-        if re.fullmatch(r"[.]{8,}", compact):
-            lines.append("." * max(70, min(len(compact), 110)))
-        else:
-            lines.append(re.sub(r"[ \t]+", " ", raw))
-    t = "\n".join(lines)
-    # Tách câu/bài và đáp án để phần xem trước không bị dính dòng.
-    t = re.sub(r"(?<!^)\s+(?=(?:Câu|Bài)\s+\d+\s*[\.:])", "\n", t)
-    t = re.sub(r"\s+(?=[A-D]\.)", "\n", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
-
-
-def _extract_pdf_text_with_dots(pdf_path: str) -> str:
-    """Lấy text layer từ PDF để giữ các dòng chấm mà OCR thường bỏ mất."""
-    try:
-        reader = PdfReader(pdf_path)
-        parts = []
-        for page in reader.pages:
-            try:
-                parts.append(page.extract_text() or "")
-            except Exception:
-                parts.append("")
-        return _normalize_pdf_text_keep_fill_dots("\n\n".join(parts))
-    except Exception:
-        return ""
-
-
-def _dot_line_count(text: str) -> int:
-    cnt = 0
-    for line in (text or "").splitlines():
-        compact = re.sub(r"\s+", "", line.replace("…", "."))
-        if re.fullmatch(r"[.]{8,}", compact):
-            cnt += 1
-    return cnt
-
 def clean_text_and_images(text: str, images: Dict[str, str]) -> str:
     cleaned = text
     cleaned = re.sub(r'OCRPageObject\(.*?\)', '', cleaned)
@@ -157,16 +101,11 @@ async def ocr_pdf_or_image(file: UploadFile = File(...)):
             tmp_path = tmp.name
 
         page_count = 1
-        pdf_text_with_dots = ""
         if is_pdf:
-            reader_for_count = PdfReader(tmp_path)
-            page_count = len(reader_for_count.pages)
+            page_count = len(PdfReader(tmp_path).pages)
             max_pages = int(os.getenv("MAX_PAGES", "100"))
             if page_count > max_pages:
                 raise HTTPException(status_code=400, detail=f"PDF có {page_count} trang, vượt giới hạn {max_pages} trang")
-            # Quan trọng: lấy text trực tiếp từ PDF để giữ các dòng chấm điền đáp án.
-            # Mistral/OCR đôi khi bỏ các dòng "........" vì coi là đường kẻ/trang trí.
-            pdf_text_with_dots = _extract_pdf_text_with_dots(tmp_path)
 
         client = Mistral(api_key=get_api_key())
         if not hasattr(client, "ocr"):
@@ -210,16 +149,7 @@ async def ocr_pdf_or_image(file: UploadFile = File(...)):
                         result["images"][img.id] = img.image_base64
         if not result["text"] or not result["images"]:
             extract_with_regex(str(ocr_response), result)
-        ocr_cleaned = clean_text_and_images(result["text"], result["images"])
-        # Nếu text lấy trực tiếp từ PDF có nhiều dòng chấm hơn OCR thì ưu tiên bản PDF text-layer.
-        # Cách này giữ đúng các dòng "................................" trong đề gốc.
-        if is_pdf and pdf_text_with_dots and _dot_line_count(pdf_text_with_dots) > _dot_line_count(ocr_cleaned):
-            result["text"] = pdf_text_with_dots
-            result["cleaned_text"] = clean_text_and_images(pdf_text_with_dots, result["images"])
-            result["dot_line_source"] = "pdf_text_layer"
-        else:
-            result["cleaned_text"] = ocr_cleaned
-            result["dot_line_source"] = "ocr"
+        result["cleaned_text"] = clean_text_and_images(result["text"], result["images"])
         return result
     except HTTPException:
         raise

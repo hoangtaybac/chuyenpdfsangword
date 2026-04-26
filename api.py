@@ -369,9 +369,60 @@ def _convert_plain_variation_tables_in_html(html: str) -> str:
     html = re.sub(r"<(p|div)([^>]*)>(.*?)</\1>", repl_block, html or "", flags=re.I|re.S)
     return html
 
+
+def _clean_latex_piece_for_docx(s: str) -> str:
+    """Làm sạch LaTeX nằm trong HTML preview trước khi đưa cho Pandoc.
+    Lỗi hay gặp: marked.js biến xuống dòng trong $$...$$ thành <br>, khiến Pandoc xuất nguyên $$ ra Word.
+    """
+    s = s or ""
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</p>\s*<p[^>]*>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = html_lib.unescape(s).replace("\xa0", " ")
+    # Chuẩn hóa vài lệnh LaTeX phổ biến nếu bị nhân đôi slash khi đi qua HTML/JSON.
+    for cmd in ["left","right","sqrt","frac","widehat","tan","approx","circ","Rightarrow","le","ge","in","notin"]:
+        s = s.replace("\\\\" + cmd, "\\" + cmd)
+    s = re.sub(r"\n{2,}", "\n", s).strip()
+    return s
+
+
+def _fix_latex_math_blocks_for_docx(html: str) -> str:
+    """Sửa công thức trước khi Pandoc đọc HTML.
+    Nếu trong $$...$$ có thẻ <br>, Pandoc thường xuất nguyên LaTeX ra Word.
+    Hàm này đổi về $$\\n...\\n$$ sạch để Word nhận Equation.
+    """
+    if not html:
+        return html
+
+    def repl_display(m):
+        latex = _clean_latex_piece_for_docx(m.group(1))
+        if not latex:
+            return ""
+        return "\n<p>$$\n" + latex + "\n$$</p>\n"
+
+    html = re.sub(r"\$\$([\s\S]*?)\$\$", repl_display, html)
+
+    def repl_bracket(m):
+        latex = _clean_latex_piece_for_docx(m.group(1))
+        if not latex:
+            return ""
+        return "\n<p>$$\n" + latex + "\n$$</p>\n"
+
+    html = re.sub(r"\\\[([\s\S]*?)\\\]", repl_bracket, html)
+
+    def repl_inline_paren(m):
+        latex = _clean_latex_piece_for_docx(m.group(1)).replace("\n", " ")
+        return r"\(" + latex + r"\)"
+
+    html = re.sub(r"\\\(([\s\S]*?)\\\)", repl_inline_paren, html)
+    return html
+
+
 def _prepare_preview_html_for_docx(html: str, workdir: Path) -> str:
     """Nhận đúng HTML phần xem trước, tách data:image ra file thật để Pandoc không lặp/không mất ảnh."""
     html = html or ""
+    # Quan trọng: sửa công thức trước khi Pandoc đọc HTML. Nếu trong $$...$$ có <br>, Word sẽ hiện nguyên LaTeX.
+    html = _fix_latex_math_blocks_for_docx(html)
     html = _convert_plain_variation_tables_in_html(html)
     img_dir = workdir / "preview_images"
     img_dir.mkdir(exist_ok=True)

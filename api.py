@@ -6,7 +6,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from PyPDF2 import PdfReader
+from PyPDF2 import PdfReader, PdfWriter
 
 try:
     from mistralai.client import Mistral
@@ -103,8 +103,9 @@ async def ocr_pdf_or_image(file: UploadFile = File(...)):
         page_count = 1
         if is_pdf:
             page_count = len(PdfReader(tmp_path).pages)
-            max_pages = int(os.getenv("MAX_PAGES", "100"))
-            if page_count > max_pages:
+            # ĐÃ BỎ CHẶN CỨNG 100 TRANG. Mặc định MAX_PAGES=0 nghĩa là không giới hạn.
+            max_pages = int(os.getenv("MAX_PAGES", "0"))
+            if max_pages > 0 and page_count > max_pages:
                 raise HTTPException(status_code=400, detail=f"PDF có {page_count} trang, vượt giới hạn {max_pages} trang")
 
         client = Mistral(api_key=get_api_key())

@@ -1,6 +1,6 @@
 import os, re, tempfile, base64, shutil, subprocess, uuid, html as html_lib, zipfile
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,52 +76,46 @@ class ExportPreviewHtmlPayload(BaseModel):
 def root():
     return {"ok": True, "service": "PDF + IMAGE OCR API", "endpoint": "POST /ocr", "support": "PDF, JPG, PNG, WEBP", "export": "POST /export-docx", "export_preview": "POST /export-docx-preview"}
 
-@app.post("/ocr")
-async def ocr_pdf_or_image(file: UploadFile = File(...)):
-    """Nhận cả PDF và ảnh (JPG/PNG/WEBP/BMP/TIFF), OCR bằng Mistral rồi trả về text + images."""
-    filename = file.filename or "upload"
-    lower_name = filename.lower()
-    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
-    is_pdf = lower_name.endswith(".pdf") or file.content_type == "application/pdf"
-    is_image = lower_name.endswith(image_exts) or (file.content_type or "").startswith("image/")
 
-    if not (is_pdf or is_image):
-        raise HTTPException(status_code=400, detail="Chỉ nhận file PDF hoặc ảnh JPG/PNG/JPEG/WEBP")
 
-    content = await file.read()
-    if len(content) > int(os.getenv("MAX_UPLOAD_BYTES", "52428800")):
-        raise HTTPException(status_code=413, detail="File quá lớn")
+def _make_pdf_chunk(src_pdf: str, start_index: int, end_index: int) -> str:
+    reader = PdfReader(src_pdf)
+    writer = PdfWriter()
+    for i in range(start_index, min(end_index, len(reader.pages))):
+        writer.add_page(reader.pages[i])
+    fd, out_path = tempfile.mkstemp(suffix=f"_pages_{start_index+1}_{end_index}.pdf")
+    os.close(fd)
+    with open(out_path, "wb") as f:
+        writer.write(f)
+    return out_path
 
-    suffix = ".pdf" if is_pdf else (Path(lower_name).suffix or ".jpg")
-    tmp_path = None
+
+def _prefix_image_ids_in_result(result_data: Dict[str, Any], prefix: str) -> None:
+    images = result_data.get("images") or {}
+    if not images:
+        return
+    text = result_data.get("text", "") or ""
+    new_images = {}
+    for old_id, b64 in images.items():
+        new_id = f"{prefix}-{old_id}"
+        new_images[new_id] = b64
+        text = text.replace(old_id, new_id)
+    result_data["images"] = new_images
+    result_data["text"] = text
+
+
+def _process_one_file_with_mistral(client, file_path: str, file_name: str, is_image: bool = False) -> Dict[str, Any]:
     uploaded_file_handle = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-
-        page_count = 1
-        if is_pdf:
-            page_count = len(PdfReader(tmp_path).pages)
-            # ĐÃ BỎ CHẶN CỨNG 100 TRANG. Mặc định MAX_PAGES=0 nghĩa là không giới hạn.
-            max_pages = int(os.getenv("MAX_PAGES", "0"))
-            if max_pages > 0 and page_count > max_pages:
-                raise HTTPException(status_code=400, detail=f"PDF có {page_count} trang, vượt giới hạn {max_pages} trang")
-
-        client = Mistral(api_key=get_api_key())
-        if not hasattr(client, "ocr"):
-            raise RuntimeError("SDK mistralai quá cũ, cần bản có client.ocr")
-
-        uploaded_file_handle = open(tmp_path, "rb")
+        uploaded_file_handle = open(file_path, "rb")
         uploaded = client.files.upload(
-            file={"file_name": filename, "content": uploaded_file_handle},
+            file={"file_name": file_name, "content": uploaded_file_handle},
             purpose="ocr"
         )
         signed_url = client.files.get_signed_url(file_id=uploaded.id)
 
         document_payload = {"type": "document_url", "document_url": signed_url.url}
         if is_image:
-            # Mistral OCR hỗ trợ ảnh qua image_url. Nếu SDK/server không hỗ trợ, fallback document_url bên dưới.
             document_payload = {"type": "image_url", "image_url": signed_url.url}
 
         try:
@@ -139,7 +133,7 @@ async def ocr_pdf_or_image(file: UploadFile = File(...)):
                 include_image_base64=True,
             )
 
-        result = {"text": "", "images": {}, "raw_response_size": len(str(ocr_response)), "pages": page_count, "file_type": "image" if is_image else "pdf"}
+        result = {"text": "", "images": {}, "raw_response_size": len(str(ocr_response))}
         if hasattr(ocr_response, "model_dump"):
             extract_from_dict(ocr_response.model_dump(), result)
         if not result["text"] and hasattr(ocr_response, "pages"):
@@ -150,21 +144,89 @@ async def ocr_pdf_or_image(file: UploadFile = File(...)):
                         result["images"][img.id] = img.image_base64
         if not result["text"] or not result["images"]:
             extract_with_regex(str(ocr_response), result)
-        result["cleaned_text"] = clean_text_and_images(result["text"], result["images"])
         return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         try:
             if uploaded_file_handle:
                 uploaded_file_handle.close()
         except Exception:
             pass
+
+@app.post("/ocr")
+async def ocr_pdf_or_image(file: UploadFile = File(...)):
+    """Nhận PDF/ảnh, tự chia PDF lớn thành batch rồi OCR bằng Mistral, sau đó ghép kết quả."""
+    filename = file.filename or "upload"
+    lower_name = filename.lower()
+    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
+    is_pdf = lower_name.endswith(".pdf") or file.content_type == "application/pdf"
+    is_image = lower_name.endswith(image_exts) or (file.content_type or "").startswith("image/")
+
+    if not (is_pdf or is_image):
+        raise HTTPException(status_code=400, detail="Chỉ nhận file PDF hoặc ảnh JPG/PNG/JPEG/WEBP")
+
+    content = await file.read()
+    if len(content) > int(os.getenv("MAX_UPLOAD_BYTES", "52428800")):
+        raise HTTPException(status_code=413, detail="File quá lớn. Có thể tăng MAX_UPLOAD_BYTES nếu server đủ khỏe.")
+
+    suffix = ".pdf" if is_pdf else (Path(lower_name).suffix or ".jpg")
+    tmp_path = None
+    chunk_paths: List[str] = []
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        page_count = 1
+        if is_pdf:
+            page_count = len(PdfReader(tmp_path).pages)
+            max_pages = int(os.getenv("MAX_PAGES", "0"))  # 0 = không chặn số trang
+            if max_pages > 0 and page_count > max_pages:
+                raise HTTPException(status_code=400, detail=f"PDF có {page_count} trang, vượt giới hạn {max_pages} trang")
+
+        client = Mistral(api_key=get_api_key())
+        if not hasattr(client, "ocr"):
+            raise RuntimeError("SDK mistralai quá cũ, cần bản có client.ocr")
+
+        batch_pages = int(os.getenv("OCR_BATCH_PAGES", "80"))  # 50-80 trang/batch thường ổn định hơn PDF dài
+        if is_image or not is_pdf or batch_pages <= 0 or page_count <= batch_pages:
+            result = _process_one_file_with_mistral(client, tmp_path, filename, is_image=is_image)
+            result.update({"pages": page_count, "file_type": "image" if is_image else "pdf", "batches": 1, "batch_pages": batch_pages})
+            result["cleaned_text"] = clean_text_and_images(result["text"], result["images"])
+            return result
+
+        combined = {"text": "", "images": {}, "raw_response_size": 0, "pages": page_count, "file_type": "pdf", "batches": 0, "batch_pages": batch_pages, "chunks": []}
+        total_batches = (page_count + batch_pages - 1) // batch_pages
+        stem = Path(filename).stem or "upload"
+
+        for batch_index, start_page in enumerate(range(0, page_count, batch_pages), start=1):
+            end_page = min(start_page + batch_pages, page_count)
+            chunk_path = _make_pdf_chunk(tmp_path, start_page, end_page)
+            chunk_paths.append(chunk_path)
+            chunk_name = f"{stem}_part_{batch_index:03d}_pages_{start_page+1}_{end_page}.pdf"
+            part = _process_one_file_with_mistral(client, chunk_path, chunk_name, is_image=False)
+            _prefix_image_ids_in_result(part, f"b{batch_index:03d}")
+
+            combined["text"] += f"\n\n<!-- BATCH {batch_index}/{total_batches}: pages {start_page+1}-{end_page} -->\n\n" + (part.get("text") or "") + "\n\n"
+            combined["images"].update(part.get("images") or {})
+            combined["raw_response_size"] += int(part.get("raw_response_size") or 0)
+            combined["batches"] += 1
+            combined["chunks"].append({"batch": batch_index, "from_page": start_page + 1, "to_page": end_page})
+
+        combined["cleaned_text"] = clean_text_and_images(combined["text"], combined["images"])
+        return combined
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        for cp in chunk_paths:
+            try:
+                if cp and os.path.exists(cp):
+                    os.unlink(cp)
+            except Exception:
+                pass
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
-
 
 def _safe_filename(name: str) -> str:
     name = re.sub(r"[^a-zA-Z0-9_\-.]+", "-", name or "ket-qua-ocr").strip("-_.")
